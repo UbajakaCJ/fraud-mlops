@@ -2,3 +2,7 @@
 *.csv
 model/*.pkl
 model/splits/
+
+*.csv
+model/*.pkl
+model/splits/
