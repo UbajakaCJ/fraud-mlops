@@ -1,0 +1,318 @@
+name: CI/CD — Fraud Detection MLOps
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Force deploy even without model change"
+        required: false
+        default: "false"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/fraud-api
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Lint & Static Analysis
+  # ─────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: 🔍 Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install lint deps
+        run: |
+          pip install ruff mypy bandit safety
+          pip install -r requirements.txt
+
+      - name: Ruff linter
+        run: ruff check app/ tests/ airflow/
+
+      - name: Ruff formatter check
+        run: ruff format --check app/ tests/
+
+      - name: Bandit security scan
+        run: bandit -r app/ -ll -x app/tests
+
+      - name: Safety dependency check
+        run: safety check -r requirements.txt
+        continue-on-error: true   # advisory — don't block on transitive vulns
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Unit & Integration Tests
+  # ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate test model artifact
+        run: |
+          python - <<'EOF'
+          import numpy as np, joblib, os
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.pipeline import Pipeline
+          from sklearn.preprocessing import StandardScaler
+
+          # Minimal fake model that satisfies the pipeline interface
+          X = np.random.randn(200, 32)
+          y = (X[:, 0] > 0).astype(int)
+          pipe = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression())])
+          pipe.fit(X, y)
+
+          os.makedirs("model", exist_ok=True)
+          joblib.dump(pipe, "model/best_model_test.pkl")
+          print("Test model saved to model/best_model_test.pkl")
+          EOF
+
+      - name: Run tests with coverage
+        env:
+          DATABASE_URL: "sqlite+aiosqlite:///./test.db"
+          REDIS_URL: "redis://localhost:6379/0"
+          MLFLOW_TRACKING_URI: "http://localhost:5000"
+          MODEL_PATH: "./model"
+          SECRET_KEY: "test-secret-key-32-chars-minimum!!"
+          ENVIRONMENT: "test"
+        run: |
+          pytest tests/ -v \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=75 \
+            -x
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: DAG validation
+  # ─────────────────────────────────────────────────────────────────────────────
+  validate-dags:
+    name: ✈️  Validate Airflow DAGs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Airflow + deps
+        run: |
+          pip install apache-airflow==2.9.1 \
+            scikit-learn xgboost lightgbm imbalanced-learn \
+            mlflow pandas numpy joblib requests
+        env:
+          AIRFLOW_HOME: /tmp/airflow
+
+      - name: Init Airflow DB
+        run: airflow db init
+        env:
+          AIRFLOW_HOME: /tmp/airflow
+
+      - name: Validate DAG syntax
+        run: |
+          export AIRFLOW_HOME=/tmp/airflow
+          export AIRFLOW__CORE__DAGS_FOLDER=$PWD/airflow/dags
+          python -c "
+          from airflow.models import DagBag
+          bag = DagBag(dag_folder='airflow/dags', include_examples=False)
+          if bag.import_errors:
+              print('DAG errors:', bag.import_errors)
+              exit(1)
+          print(f'Validated {len(bag.dags)} DAGs: {list(bag.dags.keys())}')
+          "
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4: Docker Build & Scan
+  # ─────────────────────────────────────────────────────────────────────────────
+  docker-build:
+    name: 🐳 Docker Build & Security Scan
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          load: true
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0   # advisory in CI; set to 1 to block on HIGH+
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push to registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 5: Deploy to Staging
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: 🚀 Deploy — Staging
+    runs-on: ubuntu-latest
+    needs: [docker-build, validate-dags]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://fraud-staging.bluechip.ng/docs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/fraud-mlops
+            git pull origin develop
+            docker compose pull api
+            docker compose up -d --no-deps api
+            docker compose exec -T api curl -f http://localhost:8000/health
+            echo "Staging deployment complete"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 6: Deploy to Production
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: 🏭 Deploy — Production
+    runs-on: ubuntu-latest
+    needs: [docker-build, validate-dags]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://fraud.bluechip.ng/docs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to production (blue/green)
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key:      ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/fraud-mlops
+
+            # Pull latest image
+            docker compose pull api
+
+            # Rolling restart — zero downtime
+            docker compose up -d --no-deps --scale api=2 api
+            sleep 10
+            docker compose up -d --no-deps api
+
+            # Smoke test
+            sleep 5
+            curl -f https://fraud.bluechip.ng/health || exit 1
+            echo "Production deployment complete ✓"
+
+      - name: Notify Slack on deploy
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} *Fraud API* deployed to production\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}\nRef: ${{ github.ref }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
