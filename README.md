@@ -1,7 +1,5 @@
 # 🛡️ Fraud Detection MLOps Platform
 
-**Bluechip Technologies — AI Services Department**
-
 A production-grade, end-to-end MLOps platform for real-time credit card fraud detection.
 
 ```
@@ -291,6 +289,5 @@ GitHub Environments used: `staging` and `production` (with required reviewers on
 
 ---
 
-## License
 
-Proprietary — Bluechip Technologies © 2024
+
