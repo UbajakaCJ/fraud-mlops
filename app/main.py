@@ -69,9 +69,9 @@ Bearer token (JWT). Use `POST /auth/token` with credentials to obtain a token.
 """,
     version=settings.API_VERSION,
     contact={
-        "name": "Chijioke Okonkwo — AI Services",
-        "email": "chijioke@bluechip.ng",
-        "url": "https://bluechip.ng/ai",
+        "name": "Chijioke Ubajaka — AI Services",
+        "email": "cubajaka@bluechiptech.biz",
+        "url": "https://bluechiptech.biz/",
     },
     license_info={"name": "Proprietary — Bluechip Technologies"},
     openapi_tags=[
